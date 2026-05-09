@@ -1,0 +1,6 @@
+jupyter
+pandas
+pydantic
+openai
+openpyxl
+PyYAML

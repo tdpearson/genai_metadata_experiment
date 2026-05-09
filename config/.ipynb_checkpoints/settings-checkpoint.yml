@@ -1,0 +1,6 @@
+token_auth:
+  cmd: [pass, application/ul-llm/tdp]
+  #env: UL_LITELLM_KEY
+  #prompt
+base_url:
+  https://litellm.lib.ou.edu/v1/
