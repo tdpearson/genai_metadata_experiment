@@ -4,3 +4,4 @@ pydantic
 openai
 openpyxl
 PyYAML
+tenacity
