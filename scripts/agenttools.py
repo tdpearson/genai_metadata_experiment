@@ -1,11 +1,19 @@
 import json
+import logging
 from functools import cache
+from typing import Literal
 from urllib.parse import quote
-from urllib.request import urlopen, Request
+
+import httpx
+import logfire
+from pydantic import BaseModel, Field
+from openai import pydantic_function_tool
 
 
 FAST_API_URL = "https://fast.oclc.org/fastsuggest"
 SUBJECT_DB = "fastapps-db/assignFAST"
+
+logger = logging.getLogger(__name__)
 
 
 @cache
@@ -20,51 +28,46 @@ def assignFast(query: str, queryIndex: str = "suggestall", rows: int = 5) -> lis
         f"&rows={rows}"
     )
     url = f"{FAST_API_URL}?{query_str}"
-    req = Request(url, method="GET")
-    req.add_header("User-Agent", "assignFast/1.0")
-    with urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    docs = data["response"]["docs"]
-    for d in docs:
-        if isinstance(d.get("idroot"), list):
-            d["idroot"] = d["idroot"][0]
+    logger.debug(f"Query: {query_str}")
+    with logfire.span("FAST API lookup", query=query, queryIndex=queryIndex, rows=rows) as span:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(url, headers={"User-Agent": "assignFast/1.0"})
+            resp.raise_for_status()
+            data = resp.json()
+        docs = data["response"]["docs"]
+        for d in docs:
+            if isinstance(d.get("idroot"), list):
+                d["idroot"] = d["idroot"][0]
+        span.set_attribute("result_count", len(docs))
+    logger.debug(f"Results: {docs}")
     return docs
 
 
-assignFast_tool = {
-    "type": "function",
-    "function": {
-        "name": "assignFast",
-        "description": "Query the OCLC FAST subject authority API to look up authorized FAST headings for library cataloging.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search text for the FAST heading to look up",
-                },
-                "queryIndex": {
-                    "type": "string",
-                    "enum": [
-                        "suggestall",
-                        "suggest50",
-                        "suggest51",
-                        "suggest00",
-                        "suggest10",
-                        "suggest11",
-                        "suggest30",
-                        "suggest55",
-                    ],
-                    "description": "FAST facet index: suggestall (all), suggest50 (Topical), suggest51 (Geographic), suggest00 (Personal Name), suggest10 (Corporate Name), suggest11 (Events), suggest30 (Uniform Title), suggest55 (Form/Genre)",
-                },
-                "rows": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (1-20)",
-                    "minimum": 1,
-                    "maximum": 20,
-                },
-            },
-            "required": ["query"],
-        },
-    },
-}
+class AssignFastParams(BaseModel):
+    query: str = Field(description="Search text for the FAST heading to look up")
+    queryIndex: Literal[
+        "suggestall",
+        "suggest50",
+        "suggest51",
+        "suggest00",
+        "suggest10",
+        "suggest11",
+        "suggest30",
+        "suggest55",
+    ] = Field(
+        default="suggestall",
+        description="FAST facet index: suggestall (all), suggest50 (Topical), suggest51 (Geographic), suggest00 (Personal Name), suggest10 (Corporate Name), suggest11 (Events), suggest30 (Uniform Title), suggest55 (Form/Genre)",
+    )
+    rows: int = Field(
+        default=5,
+        description="Maximum number of results to return (1-20)",
+        ge=1,
+        le=20,
+    )
+
+
+assignFast_tool = pydantic_function_tool(
+    AssignFastParams,
+    name="assignFast",
+    description="Query the OCLC FAST subject authority API to look up authorized FAST headings for library cataloging.",
+)

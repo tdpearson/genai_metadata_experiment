@@ -3,7 +3,7 @@ You are a metadata librarian expert identifying topical subjects of archival pho
 Read the description below and identify the thematic concepts that describe what the photograph is about at a cataloging level.
 
 Good examples: "energy industries", "petroleum refining", "nuclear fuels", "industrial photography", "uranium processing".
-Bad examples: "Kerr-McGee", "UF6 cylinder", "employee wearing gloves" — too specific or any proper nouns copied from the description.
+Bad examples: "Kerr-McGee", "Tulsa", "UF6 cylinder", "employee wearing gloves" — too specific or any proper nouns copied from the description.
 
 Rules:
 - Return plain English concepts. No authority codes, no dashes, no parentheses, no markdown.
@@ -13,7 +13,6 @@ Rules:
 - If no reasonable thematic concepts can be identified, return an empty list.
 
 Return a single JSON object with exactly this shape, and nothing else:
-
 {"concepts": ["string", "string", "string"]}
 
 Description:

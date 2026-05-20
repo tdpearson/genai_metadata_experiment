@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 
 from pathlib import Path
@@ -8,14 +9,34 @@ from getpass import getpass
 from typing import List, AsyncGenerator, Generator
 from functools import cache
 
+import logfire
 import pandas as pd
 import yaml
 from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI, APIStatusError
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
+from agenttools import assignFast, assignFast_tool
+
 
 logger = logging.getLogger(__name__)
+
+
+_logfire_initialized = False
+
+
+def setup_logfire():
+    global _logfire_initialized
+    if _logfire_initialized:
+        return
+    logfire.configure()
+    logfire.instrument_openai()
+    logfire.instrument_pydantic()
+    logging.getLogger().addHandler(logfire.LogfireLoggingHandler())
+    _logfire_initialized = True
+
+
+setup_logfire()
 
 
 def _fetch_settings(file_path="../config/settings.yml"):
@@ -73,20 +94,44 @@ def read_prompt(prompt_name: str) -> str:
     return Path(f"../prompts/{prompt_name}.md").read_text(encoding="utf-8")
 
 
-def extract(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str): 
-    client = _get_ai_client()
-    # TODO: add retry with backoff for 5xx server errors
-    response = client.responses.parse(
-        model=model,
-        input=[
+def extract(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
+    with logfire.span("LLM extraction", model=model, extractor=extractor.__name__) as span:
+        client = _get_ai_client()
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": record_content},
-        ],
-        # TODO: handle validation error for returned results (Invalid JSON)
-        text_format=extractor,
-        # TODO: add tool to handle assignFAST API calls with caching
-    )
-    return response.output_parsed
+        ]
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=[assignFast_tool],
+        )
+        while response.choices[0].message.tool_calls:
+            messages.append(response.choices[0].message)
+            for tool_call in response.choices[0].message.tool_calls:
+                args = json.loads(tool_call.function.arguments)
+                result = assignFast(**args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(result),
+                })
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[assignFast_tool],
+            )
+        span.set_attribute("token_usage", response.usage.total_tokens if response.usage else 0)
+        content = response.choices[0].message.content
+        try:
+            return extractor.model_validate_json(content)
+        except Exception:
+            cleaned = _clean_model_response(content)
+            if cleaned != content:
+                logger.warning(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
+                return extractor.model_validate_json(cleaned)
+            logger.warning(f"Model returned non-JSON response: {content!r}")
+            return None
 
 
 def extract_multi(model: str, system_prompt: str, extractor: type[BaseModel], record_contents: List[str]) -> Generator: 
@@ -94,30 +139,71 @@ def extract_multi(model: str, system_prompt: str, extractor: type[BaseModel], re
         yield extract(model, system_prompt, extractor, content)
 
 
+def _clean_model_response(content: str) -> str:
+    cleaned = content.strip()
+    for prefix, suffix in [("'''", "'''"), ('"""', '"""'), ("```json\n", "\n```"), ("```\n", "\n```"), ("```", "```")]:
+        if cleaned.startswith(prefix) and cleaned.endswith(suffix):
+            cleaned = cleaned[len(prefix):-len(suffix)].strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 @retry(
     wait=wait_random_exponential(min=1, max=10),
     stop=stop_after_attempt(5)
 )
-async def extract_async(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str): 
-    client = _get_ai_async_client()
-    logger.debug(f"Using model: {model}")
-    try:
-        response = await client.responses.parse(
-            model=model,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": record_content},
-            ],
-            text_format=extractor,
-            # TODO: add tool to handle assignFAST API calls with caching
-        )
-    except APIStatusError as e:
-        logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-    
-    logger.info(f"Tokens used: {response.usage.total_tokens}")
-    return response.output_parsed
+async def extract_async(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
+    with logfire.span("LLM extraction (async)", model=model, extractor=extractor.__name__) as span:
+        client = _get_ai_async_client()
+        logger.debug(f"Using model: {model}")
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": record_content},
+        ]
+        response = None
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=[assignFast_tool],
+            )
+            while response.choices[0].message.tool_calls:
+                messages.append(response.choices[0].message)
+                for tool_call in response.choices[0].message.tool_calls:
+                    args = json.loads(tool_call.function.arguments)
+                    result = assignFast(**args)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(result),
+                    })
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=[assignFast_tool],
+                )
+        except APIStatusError as e:
+            logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
+            span.set_attribute("error", str(e))
+        except Exception as e:
+            logger.exception(f"Unexpected error: {e}")
+            span.set_attribute("error", str(e))
+
+        if response:
+            logger.info(f"Tokens used: {response.usage.total_tokens}")
+            span.set_attribute("token_usage", response.usage.total_tokens)
+            content = response.choices[0].message.content
+            try:
+                return extractor.model_validate_json(content)
+            except Exception:
+                cleaned = _clean_model_response(content)
+                if cleaned != content:
+                    logger.warning(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
+                    return extractor.model_validate_json(cleaned)
+                logger.warning(f"Model returned non-JSON response: {content!r}")
+                return None
+        return None
 
 
 async def extract_multi_async(model: str, system_prompt: str, extractor: type[BaseModel], record_contents: List[str]) -> AsyncGenerator: 

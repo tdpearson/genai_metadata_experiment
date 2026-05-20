@@ -1,7 +1,11 @@
+httpx
 jupyter
-pandas
-pydantic
+logfire
 openai
 openpyxl
+pandas
+pydantic
+pytest
+pytest-asyncio
 PyYAML
 tenacity

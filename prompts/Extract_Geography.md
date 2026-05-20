@@ -26,7 +26,6 @@ Examples:
 - "Gulf of Mexico, 10.5 miles off the Louisiana coast" → two entries: {"city": "", "county": "", "state": "", "country": "", "region": "Gulf of Mexico", "is_us": false} and {"city": "", "county": "", "state": "Louisiana", "country": "USA", "region": "", "is_us": true}
 
 Return a single JSON object with exactly this shape, and nothing else:
-
 {"locations": [{"city": "", "county": "", "state": "", "country": "", "region": "", "is_us": true}]}
 
 If no locations are found, return {"locations": []}.
