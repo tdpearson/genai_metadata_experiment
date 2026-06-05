@@ -77,6 +77,16 @@ def _get_ai_async_client() -> AsyncOpenAI:
     )
 
 
+def _clean_model_response(content: str) -> str:
+    cleaned = content.strip()
+    for prefix, suffix in [("'''", "'''"), ('"""', '"""'), ("```json\n", "\n```"), ("```\n", "\n```"), ("```", "```")]:
+        if cleaned.startswith(prefix) and cleaned.endswith(suffix):
+            cleaned = cleaned[len(prefix):-len(suffix)].strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+        cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 def file_to_df(file_path: str) -> pd.DataFrame:
     file = Path(file_path)
     if not file.exists():
@@ -94,50 +104,42 @@ def read_prompt(prompt_name: str) -> str:
     return Path(f"../prompts/{prompt_name}.md").read_text(encoding="utf-8")
 
 
+@retry(
+    wait=wait_random_exponential(min=1, max=10),
+    stop=stop_after_attempt(5),
+    retry_error_callback=lambda retry_state: None
+)
 def extract(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
     client = _get_ai_client()
+    logger.debug(f"Using model: {model}")
 
-    with logfire.span("Phase 1: Candidate extraction", model=model) as span:
-        resp1 = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": record_content},
-            ],
-        )
-        content1 = resp1.choices[0].message.content
-        try:
-            candidates = json.loads(content1)
-        except Exception:
-            cleaned = _clean_model_response(content1)
-            if cleaned != content1:
-                candidates = json.loads(cleaned)
-            else:
-                logger.warning(f"Phase 1 returned non-JSON: {content1!r}")
-                return None
+    try:
+        with logfire.span("Candidate extraction (async)", model=model) as span:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": record_content},
+                ],
+                reasoning_effort="low"  # This parameter is not used by most models
+            )
+            content = resp.choices[0].message.content
+            try:
+                candidates = json.loads(content)
+            except Exception:
+                cleaned = _clean_model_response(content)
+                if cleaned != content:
+                    logger.debug(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
+                    candidates = json.loads(cleaned)
+                else:
+                    logger.error(f"Model returned non-JSON response: {content!r}")
+                    raise Exception("Non-JSON response from model")
+            
+            return extractor.model_validate(candidates)
 
-    with logfire.span("Phase 2: Server-side FAST resolution") as span:
-        fast_results = resolve_candidates(candidates)
-
-    with logfire.span("Phase 3: Selection & formatting", model=model, extractor=extractor.__name__) as span:
-        resp3 = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps({"description": record_content, "fast_results": fast_results})},
-            ],
-        )
-        content3 = resp3.choices[0].message.content
-        span.set_attribute("token_usage", resp3.usage.total_tokens if resp3.usage else 0)
-        try:
-            return extractor.model_validate_json(content3)
-        except Exception:
-            cleaned = _clean_model_response(content3)
-            if cleaned != content3:
-                logger.warning(f"Cleaned malformed model response: {content3!r} -> {cleaned!r}")
-                return extractor.model_validate_json(cleaned)
-            logger.warning(f"Model returned non-JSON response: {content3!r}")
-            return None
+    except APIStatusError as e:
+        logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
+        return None
 
 
 def extract_multi(model: str, system_prompt: str, extractor: type[BaseModel], record_contents: List[str]) -> Generator: 
@@ -145,19 +147,10 @@ def extract_multi(model: str, system_prompt: str, extractor: type[BaseModel], re
         yield extract(model, system_prompt, extractor, content)
 
 
-def _clean_model_response(content: str) -> str:
-    cleaned = content.strip()
-    for prefix, suffix in [("'''", "'''"), ('"""', '"""'), ("```json\n", "\n```"), ("```\n", "\n```"), ("```", "```")]:
-        if cleaned.startswith(prefix) and cleaned.endswith(suffix):
-            cleaned = cleaned[len(prefix):-len(suffix)].strip()
-    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
-        cleaned = cleaned[1:-1].strip()
-    return cleaned
-
-
 @retry(
     wait=wait_random_exponential(min=1, max=10),
-    stop=stop_after_attempt(5)
+    stop=stop_after_attempt(5),
+    retry_error_callback=lambda retry_state: None
 )
 async def extract_async(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
     client = _get_ai_async_client()
@@ -171,7 +164,7 @@ async def extract_async(model: str, system_prompt: str, extractor: type[BaseMode
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": record_content},
                 ],
-                reasoning_effort="low"  # This is parameter is not used by most models
+                reasoning_effort="low"  # This parameter is not used by most models
             )
             content = resp.choices[0].message.content
             try:
@@ -179,18 +172,16 @@ async def extract_async(model: str, system_prompt: str, extractor: type[BaseMode
             except Exception:
                 cleaned = _clean_model_response(content)
                 if cleaned != content:
+                    logger.debug(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
                     candidates = json.loads(cleaned)
                 else:
-                    logger.warning(f"Phase 1 returned non-JSON: {content!r}")
-                    return None
+                    logger.error(f"Model returned non-JSON response: {content!r}")
+                    raise Exception("Non-JSON response from model")
             
             return extractor.model_validate(candidates)
 
     except APIStatusError as e:
         logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
-        return None
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
         return None
 
 
