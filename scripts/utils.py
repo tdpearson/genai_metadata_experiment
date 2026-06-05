@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI, APIStatusError
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
-from agenttools import assignFast, assignFast_tool
+#from agenttools import resolve_candidates
 
 
 logger = logging.getLogger(__name__)
@@ -95,42 +95,48 @@ def read_prompt(prompt_name: str) -> str:
 
 
 def extract(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
-    with logfire.span("LLM extraction", model=model, extractor=extractor.__name__) as span:
-        client = _get_ai_client()
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": record_content},
-        ]
-        response = client.chat.completions.create(
+    client = _get_ai_client()
+
+    with logfire.span("Phase 1: Candidate extraction", model=model) as span:
+        resp1 = client.chat.completions.create(
             model=model,
-            messages=messages,
-            tools=[assignFast_tool],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": record_content},
+            ],
         )
-        while response.choices[0].message.tool_calls:
-            messages.append(response.choices[0].message)
-            for tool_call in response.choices[0].message.tool_calls:
-                args = json.loads(tool_call.function.arguments)
-                result = assignFast(**args)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": json.dumps(result),
-                })
-            response = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=[assignFast_tool],
-            )
-        span.set_attribute("token_usage", response.usage.total_tokens if response.usage else 0)
-        content = response.choices[0].message.content
+        content1 = resp1.choices[0].message.content
         try:
-            return extractor.model_validate_json(content)
+            candidates = json.loads(content1)
         except Exception:
-            cleaned = _clean_model_response(content)
-            if cleaned != content:
-                logger.warning(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
+            cleaned = _clean_model_response(content1)
+            if cleaned != content1:
+                candidates = json.loads(cleaned)
+            else:
+                logger.warning(f"Phase 1 returned non-JSON: {content1!r}")
+                return None
+
+    with logfire.span("Phase 2: Server-side FAST resolution") as span:
+        fast_results = resolve_candidates(candidates)
+
+    with logfire.span("Phase 3: Selection & formatting", model=model, extractor=extractor.__name__) as span:
+        resp3 = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps({"description": record_content, "fast_results": fast_results})},
+            ],
+        )
+        content3 = resp3.choices[0].message.content
+        span.set_attribute("token_usage", resp3.usage.total_tokens if resp3.usage else 0)
+        try:
+            return extractor.model_validate_json(content3)
+        except Exception:
+            cleaned = _clean_model_response(content3)
+            if cleaned != content3:
+                logger.warning(f"Cleaned malformed model response: {content3!r} -> {cleaned!r}")
                 return extractor.model_validate_json(cleaned)
-            logger.warning(f"Model returned non-JSON response: {content!r}")
+            logger.warning(f"Model returned non-JSON response: {content3!r}")
             return None
 
 
@@ -154,55 +160,37 @@ def _clean_model_response(content: str) -> str:
     stop=stop_after_attempt(5)
 )
 async def extract_async(model: str, system_prompt: str, extractor: type[BaseModel], record_content: str):
-    with logfire.span("LLM extraction (async)", model=model, extractor=extractor.__name__) as span:
-        client = _get_ai_async_client()
-        logger.debug(f"Using model: {model}")
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": record_content},
-        ]
-        response = None
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=[assignFast_tool],
-            )
-            while response.choices[0].message.tool_calls:
-                messages.append(response.choices[0].message)
-                for tool_call in response.choices[0].message.tool_calls:
-                    args = json.loads(tool_call.function.arguments)
-                    result = assignFast(**args)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(result),
-                    })
-                response = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=[assignFast_tool],
-                )
-        except APIStatusError as e:
-            logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
-            span.set_attribute("error", str(e))
-        except Exception as e:
-            logger.exception(f"Unexpected error: {e}")
-            span.set_attribute("error", str(e))
+    client = _get_ai_async_client()
+    logger.debug(f"Using model: {model}")
 
-        if response:
-            logger.info(f"Tokens used: {response.usage.total_tokens}")
-            span.set_attribute("token_usage", response.usage.total_tokens)
-            content = response.choices[0].message.content
+    try:
+        with logfire.span("Candidate extraction (async)", model=model) as span:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": record_content},
+                ],
+                reasoning_effort="low"  # This is parameter is not used by most models
+            )
+            content = resp.choices[0].message.content
             try:
-                return extractor.model_validate_json(content)
+                candidates = json.loads(content)
             except Exception:
                 cleaned = _clean_model_response(content)
                 if cleaned != content:
-                    logger.warning(f"Cleaned malformed model response: {content!r} -> {cleaned!r}")
-                    return extractor.model_validate_json(cleaned)
-                logger.warning(f"Model returned non-JSON response: {content!r}")
-                return None
+                    candidates = json.loads(cleaned)
+                else:
+                    logger.warning(f"Phase 1 returned non-JSON: {content!r}")
+                    return None
+            
+            return extractor.model_validate(candidates)
+
+    except APIStatusError as e:
+        logger.error(f"API Error {e.status_code}: Request ID {e.request_id}")
+        return None
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
         return None
 
 
