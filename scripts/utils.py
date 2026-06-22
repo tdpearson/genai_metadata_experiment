@@ -16,24 +16,18 @@ from pydantic import BaseModel
 from openai import OpenAI, AsyncOpenAI, APIStatusError
 from tenacity import retry, wait_random_exponential, stop_after_attempt
 
-#from agenttools import resolve_candidates
-
 
 logger = logging.getLogger(__name__)
 
 
-_logfire_initialized = False
-
-
 def setup_logfire():
-    global _logfire_initialized
-    if _logfire_initialized:
-        return
-    logfire.configure()
-    logfire.instrument_openai()
-    logfire.instrument_pydantic()
-    logging.getLogger().addHandler(logfire.LogfireLoggingHandler())
-    _logfire_initialized = True
+    try:
+        logfire.configure()
+        logfire.instrument_openai()
+        logfire.instrument_pydantic()
+        logging.getLogger().addHandler(logfire.LogfireLoggingHandler())
+    except:
+        logger.info("Logfire not configured...")
 
 
 setup_logfire()
